@@ -113,7 +113,7 @@ export default class VerilatorLinter extends BaseLinter {
         // basically DiagnosticsCollection but with ability to append diag lists
         let filesDiag = new Map();
 
-        stderr.split(/\r?\n/g).forEach((line, _, stderrLines) => {
+        stderr.split(/\r?\n/g).forEach((line, currentLineNumber, stderrLines) => {
 
 
           // if lineIndex is 0 and it doesn't start with %Error or %Warning,
@@ -123,7 +123,7 @@ export default class VerilatorLinter extends BaseLinter {
 
           // parsing previous lines for message type
           // shouldn't be more than 5 or so
-          for (let lineIndex = _; lineIndex >= 0; lineIndex--)
+          for (let lineIndex = currentLineNumber; lineIndex >= 0; lineIndex--)
           {
             if (stderrLines[lineIndex].startsWith("%Error"))
             {
@@ -160,7 +160,7 @@ export default class VerilatorLinter extends BaseLinter {
           // columNumber - columnNumber
           // verboseError - error elaboration by verilator
 
-          let errorParserRegex = new RegExp(
+          const errorParserRegex = new RegExp(
             /%(?<severity>\w+)/.source + // matches "%Warning" or "%Error"
 
             // this matches errorcode with "-" before it, but the "-" doesn't go into ErrorCode match group
@@ -223,19 +223,216 @@ export default class VerilatorLinter extends BaseLinter {
 
             colNum = isNaN(colNum) ? 0 : colNum; // for older Verilator versions (< 4.030 ~ish)
 
-            if (!isNaN(lineNum)) {
+            let endColNum = Number.MAX_VALUE;
 
-              // appending diagnostic message to an array of messages
-              // tied to a file
-              filesDiag.get(rex.groups["filePath"]).push({
-                severity: this.convertToSeverity(rex.groups["severity"]),
-                range: new vscode.Range(lineNum, colNum, lineNum, Number.MAX_VALUE),
-                message: rex.groups["verboseError"],
-                code: rex.groups["errorCode"],
-                source: 'verilator',
-              });
+            let relatedInfoMsg: string[] = [];
 
+            // verilator may output additional messages after the first one
+            // this regex parses them
+            const topRelatedInfoRegex = /\s+: \.\.\. (?<verboseError>(\S| )+)/;
+
+            // number of additional messages shouldn't be that large, but this 
+            // handles arbirary amount and checks for array end
+            for (let additionalMessageCounter: number = 1;
+              currentLineNumber + additionalMessageCounter < stderrLines.length;
+              additionalMessageCounter++
+            )
+            {
+              const additionalMessageLine = stderrLines.at(currentLineNumber + additionalMessageCounter);
+
+              // additional messages come after main one, so if we get anything else,
+              // there is no more of them
+              if (!topRelatedInfoRegex.test(additionalMessageLine))
+              {
+                break;
+              }
+
+              relatedInfoMsg.push(
+                topRelatedInfoRegex.exec(additionalMessageLine).groups["verboseError"]
+              );
             }
+
+            // should be one section per error, so no need for tags
+            // highlight can be just "^" so the number of "~"s is between 0 and line length -1
+            const highlightRegex = /\|\s+(?<highlight>\^~*)/;
+
+
+            // highlight section comes after additional messages and
+            // potentially, a constant offset can be used, but i've had issues with it
+            // usually, the first string in loop should be the one with highlight
+
+            // start offset should be 2 because generally
+            // 0 | <error message> <- currentLineIndex
+            // 1 | <string at which error has occured>
+            // 2 | <highlight line>
+            // but is left at 1 because 1 could be next error message, which would
+            // be missed by condition that checks for it. Cheap insurance.
+            for (let highlightTestOffset = 1;
+              currentLineNumber + highlightTestOffset < stderrLines.length;
+              highlightTestOffset++
+            )
+            {
+              const currentTestLine = stderrLines.at(currentLineNumber + highlightTestOffset);
+
+              // reached start of next message
+              if (currentTestLine.startsWith("%")) {break;}
+
+              // there should be only one or none highlights in message block
+              // so either it is the first one that is found, or none, in which case
+              // the default value is passed through
+              if (highlightRegex.test(currentTestLine))
+              {
+                const highlightString = highlightRegex.exec(currentTestLine).groups["highlight"];
+                endColNum = colNum + highlightString.length;
+                break;
+              }
+            }
+
+            // regex that matches "bottom" error messages that come after highlight block
+            // and provide additional info, such as what file includes the file from which
+            // the message originates
+            // const bottomMessageRegex = RegExp(
+            //   /\s+/.source + //matches spaces at the beginning
+
+            //   // parses additional info message, fairly similar to main parser regex
+            //   /((?<filePath>(\S| )+(?<fileExtension>(\.svh)|(\.sv)|(\.SV)|(\.vh)|(\.vl)|(\.v))):(?<lineNumber>\d+):(?<columnNumber>\d+):)?/.source +
+
+            //   // parses the error message itself
+            //   / \.\.\. (?<verboseError>(\S| )+)/,
+            //   "g"
+            // );
+
+            const bottomMessageRegex = /\s+((?<filePath>(\S| )+(?<fileExtension>(\.svh)|(\.sv)|(\.SV)|(\.vh)|(\.vl)|(\.v))):(?<lineNumber>\d+):(?<columnNumber>\d+):)? \.\.\. (?<verboseError>(\S| )+)/;
+
+
+
+            // theese messages can have unique ranges
+            let bottomMessages: vscode.DiagnosticRelatedInformation[] = [];
+
+            for (let bottomMessageLineOffset = 1;
+              currentLineNumber + bottomMessageLineOffset < stderrLines.length;
+              bottomMessageLineOffset++
+            )
+            {
+              const currentTestLine = stderrLines.at(currentLineNumber + bottomMessageLineOffset);
+
+              // reached start of next message
+              if (currentTestLine.startsWith("%")) {break;}
+
+              // indicates current line contains bottom message
+              const isBottomMessage = bottomMessageRegex.test(currentTestLine);
+
+              // indicates current line contains bottom message highlight
+              // note: since all loops start as offset 1 to not miss next message,
+              // highlight regex will also match main highlight, since they are formed the same way
+              // buit bottomMessages.length == 0 does indicate we're not parsing bottom messages yet
+              const isBottomHighlight = bottomMessages.length > 0 && highlightRegex.test(currentTestLine);
+
+              if (isBottomMessage)
+              {
+                const matched = bottomMessageRegex.exec(currentTestLine);
+
+                // if message doesn't have it's own location, it is assumed it's location is the same
+                // as current main message's
+
+                let currentMessageLocation: vscode.Location;
+
+                // assuming if file location is provided,
+                // there is also line and column numbers
+                if (matched.groups["filePath"]) {
+
+                  const currentMessageFile = vscode.Uri.file(matched.groups["filePath"]);
+
+                  const currentMessageRange = new vscode.Range(
+                    Number(matched.groups["lineNumber"]) - 1,
+                    Number(matched.groups["columnNumber"]) - 1,
+                    Number(matched.groups["lineNumber"]) - 1,
+                    Number.MAX_VALUE
+                  );
+
+                  currentMessageLocation = new vscode.Location(currentMessageFile, currentMessageRange);
+
+                } else {
+                  const currentMessageFile = vscode.Uri.file(rex.groups["filePath"]);
+
+                  const currentMessageRange = new vscode.Range(lineNum, colNum, lineNum, endColNum);
+
+                  currentMessageLocation = new vscode.Location(currentMessageFile, currentMessageRange);
+                }
+
+                const currentMessage = matched.groups["verboseError"]
+                bottomMessages.push(
+                  new vscode.DiagnosticRelatedInformation(
+                    currentMessageLocation,
+                    currentMessage
+                  )
+                );
+              }
+
+              // parsing highlight for last bottom message
+              if (isBottomHighlight)
+              {
+                const highlightString = highlightRegex.exec(currentTestLine).groups["highlight"];
+
+                // no need to change start position
+                const newStart = bottomMessages[bottomMessages.length -1].location.range.start;
+
+                // since highlights are single-line, no need only highlight length
+                // needs to be adjusted 
+                const newEnd = new vscode.Position(
+                  newStart.line,
+                  newStart.character + highlightString.length
+                );
+
+                let newRange: vscode.Range = new vscode.Range(
+                  newStart,
+                  newEnd
+                );
+
+                // need to update range since all further members are readonly
+                bottomMessages[bottomMessages.length -1].location.range = newRange;
+              }
+            }
+
+
+            // template for diagnostics that share location and Verilator outputs together
+            // additional ones look line "        : ... <message>"
+            // they all presumably refer to same portion of the code, but additional messages
+            // don't have error codes
+            const diagTemplate: vscode.Diagnostic = {
+              severity: this.convertToSeverity(rex.groups["severity"]),
+              range: new vscode.Range(lineNum, colNum, lineNum, endColNum),
+              message: "",
+              source: 'verilator',
+            };
+
+            if (isNaN(lineNum)) {return;}
+            
+            // filling fields for main message
+            let mainMessageDiag = Object.assign({}, diagTemplate);
+            mainMessageDiag.code = rex.groups["errorCode"];
+            mainMessageDiag.message = rex.groups["verboseError"];
+
+            // pushing main message
+            filesDiag.get(rex.groups["filePath"]).push(mainMessageDiag);
+
+            const currentMsgLocation = new vscode.Location(
+              vscode.Uri.file(rex.groups["filePath"]),
+              mainMessageDiag.range
+            );
+
+            mainMessageDiag.relatedInformation = [];
+            
+            mainMessageDiag.relatedInformation = mainMessageDiag.relatedInformation.concat(bottomMessages);
+
+
+            // pushing additional messages
+            relatedInfoMsg.forEach(message => {
+              mainMessageDiag.relatedInformation.push(
+                new vscode.DiagnosticRelatedInformation(currentMsgLocation, message)
+              );
+            });
+            
             return;
           }
         });
